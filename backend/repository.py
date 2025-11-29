@@ -339,3 +339,170 @@ class Repository:
         if conversation:
             return conversation.get("metadata", {}) or {}
         return {}
+
+    # ============================================
+    # CONTEXT ENRICHMENT - Para recomendaciones inteligentes
+    # ============================================
+    
+    def get_top_products_by_orders(self, tenant_id: str, days: int = 7, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get most ordered products for a tenant in the last N days
+        
+        Returns products ranked by number of times they were ordered.
+        """
+        from datetime import timedelta
+        
+        # Get orders from last N days
+        since_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        
+        orders = self.client.table("orders")\
+            .select("id")\
+            .eq("tenant_id", tenant_id)\
+            .gte("created_at", since_date)\
+            .execute()
+        
+        if not orders.data:
+            return []
+        
+        order_ids = [o["id"] for o in orders.data]
+        
+        # Get order items
+        order_items = self.client.table("order_items")\
+            .select("product_id, quantity")\
+            .in_("order_id", order_ids)\
+            .execute()
+        
+        if not order_items.data:
+            return []
+        
+        # Count by product
+        from collections import Counter
+        product_counts = Counter()
+        for item in order_items.data:
+            product_counts[item["product_id"]] += item["quantity"]
+        
+        # Get top products with details
+        top_product_ids = [p[0] for p in product_counts.most_common(limit)]
+        
+        if not top_product_ids:
+            return []
+        
+        products = self.client.table("products")\
+            .select("id, name, price, category")\
+            .in_("id", top_product_ids)\
+            .execute()
+        
+        # Add order count to each product
+        result = []
+        for p in products.data:
+            p["order_count"] = product_counts[p["id"]]
+            result.append(p)
+        
+        # Sort by order count
+        result.sort(key=lambda x: x["order_count"], reverse=True)
+        return result
+    
+    def get_popular_products_by_mentions(self, tenant_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get products most mentioned in conversations
+        
+        Analyzes messages to find which products are talked about most.
+        """
+        # Get all products for this tenant
+        products = self.get_products(tenant_id)
+        if not products:
+            return []
+        
+        # Get all messages for this tenant
+        messages = self.get_all_messages_for_tenant(tenant_id)
+        if not messages:
+            return products[:limit]  # Return first products if no messages
+        
+        # Count mentions
+        from collections import Counter
+        mention_counts = Counter()
+        
+        for product in products:
+            product_name_lower = product["name"].lower()
+            for message in messages:
+                if product_name_lower in message["text"].lower():
+                    mention_counts[product["id"]] += 1
+        
+        # Get top mentioned products
+        top_ids = [p[0] for p in mention_counts.most_common(limit)]
+        
+        result = []
+        for p in products:
+            if p["id"] in top_ids:
+                p["mention_count"] = mention_counts[p["id"]]
+                result.append(p)
+        
+        result.sort(key=lambda x: x.get("mention_count", 0), reverse=True)
+        return result if result else products[:limit]
+    
+    def get_tenant_insights(self, tenant_id: str) -> Dict[str, Any]:
+        """Get aggregated insights for a tenant
+        
+        Returns peak hours, popular products, common questions.
+        """
+        insights = {
+            "peak_hours": [],
+            "top_products": [],
+            "total_orders": 0,
+            "total_conversations": 0,
+            "avg_rating": None
+        }
+        
+        # Peak hours from stats
+        stats = self.get_tenant_stats(tenant_id, limit=168)  # Last week
+        if stats:
+            from collections import Counter
+            hour_counts = Counter()
+            for s in stats:
+                hour_counts[s["hour"]] += s.get("interactions_count", 0)
+            insights["peak_hours"] = [{"hour": h, "count": c} for h, c in hour_counts.most_common(3)]
+        
+        # Top products
+        insights["top_products"] = self.get_top_products_by_orders(tenant_id, days=30, limit=3)
+        
+        # Total orders
+        orders = self.client.table("orders").select("id").eq("tenant_id", tenant_id).execute()
+        insights["total_orders"] = len(orders.data) if orders.data else 0
+        
+        # Total conversations
+        convs = self.client.table("conversations").select("id").eq("tenant_id", tenant_id).execute()
+        insights["total_conversations"] = len(convs.data) if convs.data else 0
+        
+        # Average rating
+        reviews = self.client.table("reviews").select("rating").eq("tenant_id", tenant_id).execute()
+        if reviews.data:
+            ratings = [r["rating"] for r in reviews.data]
+            insights["avg_rating"] = round(sum(ratings) / len(ratings), 1)
+        
+        return insights
+    
+    def get_enriched_context(self, tenant_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get full enriched context for LLM
+        
+        This is the main method that aggregates all context for intelligent responses.
+        """
+        context = {
+            "tenant_insights": self.get_tenant_insights(tenant_id),
+            "top_products_week": self.get_top_products_by_orders(tenant_id, days=7, limit=5),
+            "popular_products": self.get_popular_products_by_mentions(tenant_id, limit=5),
+            "user_preferences": [],
+            "user_order_history": [],
+            "network_patterns": []
+        }
+        
+        # User-specific context
+        if user_id:
+            context["user_preferences"] = self.get_user_preferences(user_id, tenant_id)
+            context["user_order_history"] = self.get_user_order_history(user_id, tenant_id, limit=5)
+        
+        # Network patterns (cross-tenant insights)
+        demand_signals = self.get_demand_signals(limit=5, min_confidence=0.6)
+        context["network_patterns"] = [
+            {"pattern": s.get("description", ""), "confidence": s.get("confidence_score", 0)}
+            for s in demand_signals
+        ]
+        
+        return context

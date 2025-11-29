@@ -243,15 +243,17 @@ def classify_intent(state: AgentState) -> AgentState:
 
 def handle_faq(state: AgentState) -> AgentState:
     """
-    Handle FAQ queries using RAG (Retrieval-Augmented Generation).
+    Handle FAQ queries using RAG (Retrieval-Augmented Generation) with ENRICHED CONTEXT.
     
-    This node retrieves relevant context from the knowledge base
-    and generates an appropriate response using RAG with user personalization.
+    This node retrieves relevant context from the knowledge base,
+    enriches it with business insights, popular products, and user history,
+    then generates an intelligent response that can recommend based on real data.
     
     Requirements 1.1, 1.2, 1.3: FAQ handling with RAG and tenant filtering
     """
     from database import get_supabase_client
     from rag_service import RAGService
+    from repository import Repository
     
     try:
         # Get the user's message
@@ -274,64 +276,125 @@ def handle_faq(state: AgentState) -> AgentState:
         
         # Get user context for personalization
         user_context = state.get("user_context")
+        user_id = user_context.get("user_id") if user_context else None
         
-        # Initialize RAG service
+        # Initialize services
         supabase_client = get_supabase_client()
         rag_service = RAGService(supabase_client)
+        repo = Repository(supabase_client)
         
         # Retrieve relevant context using RAG (Requirement 1.2, 1.3)
-        context = rag_service.retrieve_context(user_query, tenant_id, top_k=5)
+        rag_context = rag_service.retrieve_context(user_query, tenant_id, top_k=5)
         
         # Store context in state
-        state["context"] = context
+        state["context"] = rag_context
         
-        # Check if we found relevant information
-        if not context or context == "No relevant information found.":
-            # Requirement 1.4: Indicate when information is insufficient
-            state["final_response"] = (
-                "I apologize, but I don't have enough information to answer that question. "
-                "This query may require human assistance. Is there anything else I can help you with?"
-            )
-            return state
+        # ============================================
+        # ENRICHED CONTEXT - Business Intelligence
+        # ============================================
+        enriched = repo.get_enriched_context(tenant_id, user_id)
+        
+        # Build enriched context string for LLM
+        enriched_context = ""
+        
+        # Top products this week (for recommendations)
+        if enriched.get("top_products_week"):
+            top_prods = enriched["top_products_week"][:3]
+            enriched_context += "\n\nPRODUCTOS MÁS PEDIDOS ESTA SEMANA:\n"
+            for p in top_prods:
+                enriched_context += f"- {p['name']}: {p.get('order_count', 0)} pedidos (${p['price']})\n"
+        
+        # Popular products by mentions
+        if enriched.get("popular_products"):
+            pop_prods = enriched["popular_products"][:3]
+            enriched_context += "\nPRODUCTOS MÁS CONSULTADOS:\n"
+            for p in pop_prods:
+                enriched_context += f"- {p['name']}: {p.get('mention_count', 0)} menciones\n"
+        
+        # Tenant insights
+        insights = enriched.get("tenant_insights", {})
+        if insights:
+            enriched_context += f"\nINFORMACIÓN DEL NEGOCIO:\n"
+            if insights.get("total_orders"):
+                enriched_context += f"- Total de pedidos históricos: {insights['total_orders']}\n"
+            if insights.get("avg_rating"):
+                enriched_context += f"- Calificación promedio: {insights['avg_rating']}/5\n"
+            if insights.get("peak_hours"):
+                hours = [f"{h['hour']}:00" for h in insights["peak_hours"][:2]]
+                enriched_context += f"- Horas pico: {', '.join(hours)}\n"
+        
+        # User history (if available)
+        if enriched.get("user_order_history"):
+            user_orders = enriched["user_order_history"][:3]
+            enriched_context += f"\nHISTORIAL DEL CLIENTE:\n"
+            for order in user_orders:
+                items = order.get("order_items", [])
+                if items:
+                    item_names = [f"{i.get('quantity', 1)}x producto" for i in items[:2]]
+                    enriched_context += f"- Pedido anterior: {', '.join(item_names)} (${order.get('total_amount', 0)})\n"
+        
+        # User preferences
+        if enriched.get("user_preferences"):
+            prefs = enriched["user_preferences"][:3]
+            enriched_context += f"\nPREFERENCIAS CONOCIDAS DEL CLIENTE:\n"
+            for p in prefs:
+                enriched_context += f"- {p['preference_type']}: {p['preference_value']} (confianza: {p['confidence']:.0%})\n"
+        
+        # Network patterns
+        if enriched.get("network_patterns"):
+            patterns = enriched["network_patterns"][:2]
+            enriched_context += f"\nPATRONES DE LA RED (insights globales):\n"
+            for p in patterns:
+                if p.get("pattern"):
+                    enriched_context += f"- {p['pattern']}\n"
         
         # Build personalization context
         personalization = ""
         if user_context:
             user_name = user_context.get("user_name", "")
             is_returning = user_context.get("is_returning_customer", False)
-            preferences = user_context.get("preferences", [])
             
             if user_name:
-                personalization += f"\nCustomer name: {user_name}"
+                personalization += f"\nNombre del cliente: {user_name}"
             if is_returning:
-                personalization += f"\nThis is a returning customer who has interacted with us before."
-            if preferences:
-                pref_list = [f"- {p.get('preference_type')}: {p.get('preference_value')}" for p in preferences[:3]]
-                personalization += f"\nKnown preferences:\n" + "\n".join(pref_list)
+                personalization += f"\nEs un cliente recurrente - sé cálido y reconoce su lealtad."
         
-        # Generate response using LLM with retrieved context (Requirement 1.1)
+        # Generate response using LLM with FULL enriched context
         llm = get_llm()
         
-        response_prompt = f"""You are a friendly and helpful customer service assistant. Use the following context to answer the user's question.
-If the context doesn't contain enough information to fully answer the question, say so politely.
+        response_prompt = f"""Eres un asistente de atención al cliente amigable e inteligente. 
 
-IMPORTANT: Respond in the same language as the user's question. If they write in Spanish, respond in Spanish. If in English, respond in English.
-{f"Address the customer by their name ({user_context.get('user_name')}) to make the interaction more personal." if user_context and user_context.get('user_name') else ""}
-{f"This is a returning customer - be warm and acknowledge their loyalty." if user_context and user_context.get('is_returning_customer') else ""}
+CAPACIDADES ESPECIALES:
+- Puedes RECOMENDAR productos basándote en los datos reales de ventas y popularidad
+- Puedes PERSONALIZAR respuestas según el historial del cliente
+- Puedes usar INSIGHTS del negocio para dar mejores respuestas
 
-Context:
-{context}
+REGLAS:
+1. Responde en el MISMO IDIOMA que el usuario (español si escribe en español)
+2. Si el usuario pide una recomendación, USA los datos de productos más pedidos
+3. Si conoces preferencias del cliente, menciónalas naturalmente
+4. Sé conciso pero informativo
+
+{f"Dirígete al cliente por su nombre: {user_context.get('user_name')}" if user_context and user_context.get('user_name') else ""}
+
+CONTEXTO DE FAQs Y PRODUCTOS:
+{rag_context}
+
+INTELIGENCIA DE NEGOCIO (usa esto para recomendar):
+{enriched_context}
 {personalization}
 
-User Question: {user_query}
+PREGUNTA DEL USUARIO: {user_query}
 
-Provide a helpful, friendly, and personalized response:"""
+Responde de forma útil, amigable y personalizada. Si pide recomendación, recomienda basándote en los datos reales:"""
         
         response = llm.invoke([HumanMessage(content=response_prompt)])
         state["final_response"] = response.content
         
     except Exception as e:
         print(f"FAQ handler error: {e}")
+        import traceback
+        traceback.print_exc()
         state["final_response"] = (
             "I apologize, but I encountered an issue processing your question. "
             "Please try again or contact us directly for assistance."
